@@ -184,6 +184,11 @@ export class BotRunner {
   // Trailing stop loss tracking
   private highestPrice: number | null = null; // For long positions
   private lowestPrice: number | null = null; // For short positions
+  // Anti-whipsaw protections
+  private barCount = 0; // Track bars for warmup
+  private positionOpenedAt = 0; // Track when position was opened
+  private readonly WARMUP_BARS = 10; // Don't trade for first 10 bars (5 minutes)
+  private readonly MIN_HOLD_BARS = 6; // Hold position for at least 6 bars (3 minutes)
 
   constructor(
     private readonly config: AppConfig,
@@ -205,7 +210,7 @@ export class BotRunner {
     }
     
     this.restPoller = new RestPoller(config.credentials);
-    this.stateManager = new PositionStateManager();
+    this.stateManager = new PositionStateManager(config.mode);
     this.orderTracker = new OrderTracker();
     this.statePersistence = new StatePersistence();
     this.loadWarmState();
@@ -412,6 +417,21 @@ export class BotRunner {
       return;
     }
     this.lastBarCloseTime = bar.endTime;
+    this.barCount++;
+
+    // Warmup period - don't trade until indicators have stabilized
+    if (this.barCount <= this.WARMUP_BARS) {
+      if (this.barCount === 1) {
+        this.log("⏳ Warmup period started", {
+          barsRequired: this.WARMUP_BARS,
+          timeRequired: `${(this.WARMUP_BARS * 30) / 60} minutes`
+        });
+      }
+      if (this.barCount === this.WARMUP_BARS) {
+        this.log("✅ Warmup complete - trading enabled");
+      }
+      return; // Skip trading during warmup
+    }
 
     // Check if trading is frozen
     if (this.tradingFrozen) {
@@ -444,9 +464,25 @@ export class BotRunner {
       const adxReady = indicators.adx !== null;
       const marketRegimeOk = !requireTrendingMarket || (adxReady && (this.engine as PeachHybridEngine).shouldAllowTrading(adxThreshold));
 
+      // Calculate unrealized PnL if in position
+      let positionInfo = {};
+      if (this.position.side !== "flat" && this.position.entryPrice) {
+        const priceDiff = this.position.side === "long"
+          ? bar.close - this.position.entryPrice
+          : this.position.entryPrice - bar.close;
+        const unrealizedPnl = priceDiff * this.position.size;
+        const unrealizedPnlPct = (priceDiff / this.position.entryPrice) * 100 * this.config.risk.maxLeverage;
+
+        positionInfo = {
+          position: `${this.position.side.toUpperCase()} @ ${this.position.entryPrice.toFixed(4)}`,
+          unrealizedPnL: `${unrealizedPnl >= 0 ? '+' : ''}${unrealizedPnl.toFixed(2)} USDT (${unrealizedPnlPct >= 0 ? '+' : ''}${unrealizedPnlPct.toFixed(2)}%)`,
+        };
+      }
+
       this.log("Peach indicators updated", {
         price: bar.close.toFixed(4),
         volume: bar.volume.toFixed(2),
+        ...positionInfo,
         v1: {
           emaFast: indicators.v1.emaFast?.toFixed(4),
           emaMid: indicators.v1.emaMid?.toFixed(4),
@@ -552,6 +588,15 @@ export class BotRunner {
         return this.log("Flip budget exhausted, ignoring long signal");
       }
       if (this.position.side === "short") {
+        // Check minimum hold time before allowing flip
+        const barsHeld = this.barCount - this.positionOpenedAt;
+        if (barsHeld < this.MIN_HOLD_BARS) {
+          return this.log("⏳ Minimum hold time not met, ignoring flip signal", {
+            barsHeld,
+            barsRequired: this.MIN_HOLD_BARS,
+            timeRemaining: `${((this.MIN_HOLD_BARS - barsHeld) * 30)} seconds`
+          });
+        }
         this.closePosition("flip-long", { price: bar.close });
       }
       this.enterPosition("long", order);
@@ -566,6 +611,15 @@ export class BotRunner {
         return this.log("Flip budget exhausted, ignoring short signal");
       }
       if (this.position.side === "long") {
+        // Check minimum hold time before allowing flip
+        const barsHeld = this.barCount - this.positionOpenedAt;
+        if (barsHeld < this.MIN_HOLD_BARS) {
+          return this.log("⏳ Minimum hold time not met, ignoring flip signal", {
+            barsHeld,
+            barsRequired: this.MIN_HOLD_BARS,
+            timeRemaining: `${((this.MIN_HOLD_BARS - barsHeld) * 30)} seconds`
+          });
+        }
         this.closePosition("flip-short", { price: bar.close });
       }
       this.enterPosition("short", order);
@@ -636,6 +690,8 @@ export class BotRunner {
       entryPrice: order.price,
       openedAt: order.timestamp,
     };
+    // Track when position was opened for minimum hold time
+    this.positionOpenedAt = this.barCount;
     // Reset trailing stop tracking
     this.highestPrice = side === "long" ? order.price : null;
     this.lowestPrice = side === "short" ? order.price : null;

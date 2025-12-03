@@ -23,6 +23,11 @@ export class PositionStateManager {
 
   private reconciliationFailures = 0;
   private readonly maxReconciliationFailures = 2;
+  private readonly isDryRun: boolean;
+
+  constructor(mode: "dry-run" | "live" = "live") {
+    this.isDryRun = mode === "dry-run";
+  }
 
   updateLocalState(update: Partial<LocalPositionState>): void {
     this.state = {
@@ -70,7 +75,14 @@ export class PositionStateManager {
 
     // If REST says flat but local has a position, trust REST (position was closed externally)
     // This handles stale state from previous runs
+    // SKIP in dry-run mode - simulated positions won't exist in REST
     if (restStateNormalized.side === "flat" && localStateNormalized.side !== "flat") {
+      if (this.isDryRun) {
+        // In dry-run mode, ignore REST reconciliation for simulated positions (silent)
+        this.reconciliationFailures = 0;
+        return true;
+      }
+
       console.log(`[PositionState] REST shows flat position, clearing local state (was ${localStateNormalized.side} ${localStateNormalized.size})`);
       this.reconciliationFailures = 0;
       this.state = {
